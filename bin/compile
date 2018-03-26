@@ -123,9 +123,11 @@ function patch_chroot() {
 
 # parse and derive params
 BUILDPACK_DIR=`cd $(dirname $0); cd ..; pwd`
-BUILD_DIR=$1
+PKG_DIR=$1
 CACHE_DIR=$2
 ENV_DIR=$3
+
+BUILD_DIR=/app
 
 # fix STACK variable if unset
 if [ -z "${STACK}" ]; then
@@ -146,8 +148,8 @@ if [[ ! "$STACK" == "heroku-16" ]]; then
 fi
 
 # read in R version if file exists
-if [[ -f "$BUILD_DIR/.r-version" ]]; then
-  R_VERSION=`read_var $BUILD_DIR/.r-version`
+if [[ -f "$PKG_DIR/.r-version" ]]; then
+  R_VERSION=`read_var $PKG_DIR/.r-version`
   echo "NOTE: Using R version override [$R_VERSION]" | indent
 else
   R_VERSION="3.4.0"
@@ -157,6 +159,8 @@ fi
 TOOLS_DIR="$BUILD_DIR/.tools"
 FAKECHROOT_DIR="$TOOLS_DIR/fakechroot"
 CHROOT_DIR="$BUILD_DIR/.root"
+APP_DIR="$CHROOT_DIR/app"
+
 # Note: fakeroot is included at buildtime, so no need to reference our copy at this stage
 
 export PATH="$FAKECHROOT_DIR/sbin:$FAKECHROOT_DIR/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
@@ -184,12 +188,17 @@ curl $R_BINARIES -s -o - | tar xzf - -C .
 popd > /dev/null
 
 # set to build dir, so packages can be installed
-patch_chroot "/app" "$BUILD_DIR"
+# patch_chroot "/app" "$BUILD_DIR"
 
 pushd $CHROOT_DIR > /dev/null
 
 # link app dir into chroot
-ln -sf $BUILD_DIR app
+# ln -sf $BUILD_DIR app
+
+# copy files instead, to avoid symlinking
+# causes issues now that it's copied... e.g. for other buildpacks, or if changed in original location
+mkdir -p app
+cp -R "$PKG_DIR/." app
 
 # make /app the home directory since application
 # authors will expect the same behaviour within the chroot
@@ -215,7 +224,7 @@ fakechroot fakeroot chroot $CHROOT_DIR \
 popd > /dev/null
 
 # Aptfile?
-if [[ -f "$BUILD_DIR/Aptfile" ]]; then
+if [[ -f "$APP_DIR/Aptfile" ]]; then
 
   topic "Installing binary dependencies from Aptfile"
 
@@ -224,7 +233,7 @@ if [[ -f "$BUILD_DIR/Aptfile" ]]; then
   PACKAGES=""
   while IFS='' read -r PACKAGE || [[ -n "$PACKAGE" ]]; do
     PACKAGES="$PACKAGES $PACKAGE"
-  done < "$BUILD_DIR/Aptfile"
+  done < "$APP_DIR/Aptfile"
 
   fakechroot fakeroot chroot $CHROOT_DIR \
     apt-get update > /dev/null
@@ -249,10 +258,10 @@ topic "Executing init.r script"
 
 # get the init.r file to use
 # it can be init.[rR] or run.R
-if [[ -f "$BUILD_DIR/init.r" ]]; then
-  INIT_FILE="$BUILD_DIR/init.r"
-elif [[ -f "$BUILD_DIR/init.R" ]]; then
-  INIT_FILE="$BUILD_DIR/init.R"
+if [[ -f "$APP_DIR/init.r" ]]; then
+  INIT_FILE="$APP_DIR/init.r"
+elif [[ -f "$APP_DIR/init.R" ]]; then
+  INIT_FILE="$APP_DIR/init.R"
 else
   # assuming run.R is present
   unset INIT_FILE
@@ -261,13 +270,13 @@ fi
 if [[ ! -z "$INIT_FILE" ]]; then
 
   # prepare wrapper script
-  WRAPPER="$BUILD_DIR/wrapper.R"
+  WRAPPER="$APP_DIR/wrapper.R"
   cp "$BUILDPACK_DIR/bin/wrapper.R" $WRAPPER
 
   # perform insertions
   #  would have preferred to use sed or awk for this, but it's real tricky with multi-line
   #  replacements, so using a Ruby program, as Ruby is installed on Heroku by default
-  ruby "$BUILDPACK_DIR/bin/util.rb" "$WRAPPER" "$INIT_FILE" "$BUILD_DIR" "$CRAN_MIRROR"
+  ruby "$BUILDPACK_DIR/bin/util.rb" "$WRAPPER" "$INIT_FILE" "$APP_DIR" "$CRAN_MIRROR"
 
   # execute the init wrapper
   # working directory must be /app so that provided packages/scripts can be found
@@ -275,12 +284,16 @@ if [[ ! -z "$INIT_FILE" ]]; then
     /usr/bin/R --no-init-file --no-save --quiet --slave --file=/app/wrapper.R 2>&1 | indent
 
   # determine whether the R script failed
-  if [[ -f "$CHROOT_DIR/app/status" ]]; then
+  if [[ -f "$APP_DIR/status" ]]; then
     echo "R $R_VERSION successfully installed (with init)" | indent
   else
     echo -e "\033[1;31mERROR: R $R_VERSION failed while executing \"init\". Check the log for details.\033[0m" | indent
     exit 1
   fi
+
+  # clean up
+  rm $WRAPPER
+  rm -rf "$APP_DIR/status"
 
 else
 
@@ -289,28 +302,32 @@ else
 fi
 
 # fix up /app symlink for runtime location
-pushd $CHROOT_DIR > /dev/null
-rm app
-ln -s /app app
-popd > /dev/null
+# pushd $CHROOT_DIR > /dev/null
+# rm app
+# ln -s /app app
+# popd > /dev/null
 
 # remove unneeded files to reduce slug size
-rm -rf $CHROOT_DIR/tmp/*.rds
-rm -rf $CHROOT_DIR/tmp/downloaded_packages/*
-rm -rf $CHROOT_DIR/var/cache/apt
-rm -rf $CHROOT_DIR/var/lib/dpkg
+rm -rf $APP_DIR/tmp/*.rds
+rm -rf $APP_DIR/tmp/downloaded_packages/*
+rm -rf $APP_DIR/var/cache/apt
+rm -rf $APP_DIR/var/lib/dpkg
 
 # when deployed, the path will be /app
-patch_chroot "$BUILD_DIR" "/app"
+# patch_chroot "$BUILD_DIR" "/app"
+
+# HACKSAW
+cp -R "$BUILD_DIR/.tools" "$PKG_DIR"
+cp -R "$BUILD_DIR/.root"  "$PKG_DIR"
 
 # copy over environment
-mkdir -p "$BUILD_DIR/.profile.d"
-cp "$BUILDPACK_DIR/bin/renv.sh" "$BUILD_DIR/.profile.d/renv.sh"
+mkdir -p "$PKG_DIR/.profile.d"
+cp "$BUILDPACK_DIR/bin/renv.sh" "$PKG_DIR/.profile.d/renv.sh"
 
 # copy wrappers to /app/bin
-mkdir -p "$BUILD_DIR/bin"
-cp "$BUILDPACK_DIR/bin/R_wrapper" "$BUILD_DIR/bin/R"
-cp "$BUILDPACK_DIR/bin/Rscript_wrapper" "$BUILD_DIR/bin/Rscript"
+mkdir -p "$PKG_DIR/bin"
+cp "$BUILDPACK_DIR/bin/R_wrapper" "$PKG_DIR/bin/R"
+cp "$BUILDPACK_DIR/bin/Rscript_wrapper" "$PKG_DIR/bin/Rscript"
 
 # TODO: cache build
 
